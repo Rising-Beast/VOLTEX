@@ -492,9 +492,10 @@ multimeter.
 
 Add the project team members and their roles here, for example:
 
--   **Hardware and firmware:** `[Names]`
--   **Dashboard and software:** `[Names]`
--   **Testing and documentation:** `[Names]`
+-   **Hardware and firmware:** `Rudra Prasad, Sai Ayushman`
+-   **Dashboard and software:** `Sai Ayushman`
+-   **Testing and documentation:** `Rudra Prasad, Sai Ayushman`
+-   **Financial support:** `Group-2 ETC 5th Sem (2026)`
 
 Replace placeholders with the actual contributors.
 
