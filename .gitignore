@@ -1,0 +1,30 @@
+# ==========================================
+# VOLTEX - Root Git Ignore
+# ==========================================
+
+# ---------- SOFTWARE: React + Vite ----------
+software/node_modules/
+software/dist/
+
+# Environment variables
+software/.env
+software/.env.*
+!software/.env.example
+
+# ---------- HARDWARE: PlatformIO ----------
+hardware/.pio/
+
+# Generated VS Code / IntelliSense files
+hardware/.vscode/.browse.c_cpp.db*
+hardware/.vscode/c_cpp_properties.json
+hardware/.vscode/launch.json
+hardware/.vscode/ipch/
+
+# ---------- Operating System ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Logs ----------
+*.log
+npm-debug.log*
