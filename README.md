@@ -458,11 +458,11 @@ Update these checkboxes as each item is tested on the actual project.
 -   [ ] Validate input protection and component ratings for every mode.
 -   [ ] Calibrate voltage, resistance, current, and temperature
     measurements as applicable.
--   [ ] Verify BLE connection, data format, and two-way command
+-   [x] Verify BLE connection, data format, and two-way command
     handling.
--   [ ] Verify that device-side controls and dashboard-side controls
+-   [x] Verify that device-side controls and dashboard-side controls
     remain synchronized.
--   [ ] Test update latency and behavior after disconnect/reconnect.
+-   [x] Test update latency and behavior after disconnect/reconnect.
 -   [ ] Validate repeatability against suitable reference instruments.
 -   [ ] Document final pin mapping, component values, ranges, and
     calibration procedure.
@@ -497,7 +497,6 @@ Add the project team members and their roles here, for example:
 -   **Testing and documentation:** `Rudra Prasad, Sai Ayushman`
 -   **Financial support:** `Group-2 ETC 5th Sem (2026)`
 
-Replace placeholders with the actual contributors.
 
 ## 📄 License
 
