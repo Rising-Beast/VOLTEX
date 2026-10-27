@@ -1,5 +1,7 @@
 # ⚡ VOLTEX --- Smart Digital Multimeter
 
+**🌐 Live Dashboard:** [https://voltex-rho.vercel.app/](https://voltex-rho.vercel.app/)
+
 **A smart ESP32-based digital multimeter with an embedded display,
 measurement firmware, and a responsive web dashboard for live readings,
 error analysis, statistics, and signal visualization.**
