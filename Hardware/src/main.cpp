@@ -16,7 +16,6 @@
 #define SCL_PIN 22
 #define MODE_BUTTON_PIN 25
 #define HOLD_BUTTON_PIN 26
-#define LM35_PIN 34
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(
     U8G2_R0, U8X8_PIN_NONE
@@ -44,8 +43,49 @@ bool bleStateChanged = false; // State changes are redrawn safely from loop().
 float liveTemperature = 0.0f;
 float heldTemperature = 0.0f;
 
+// Shared HOLD snapshots: OLED and BLE transmit the same captured readings.
+float heldInputVoltage = 0.0f;
+bool heldVoltageAdcValid = false;
+float heldResistanceOhms = 0.0f;
+bool heldResistanceAdcValid = false;
+bool heldResistanceOpen = false;
+bool heldContinuityClosed = false;
+bool heldContinuityAdcValid = false;
+
 bool adsFound = false;
 uint8_t adsAddress = 0;
+
+// DC voltage measurement on ADS1115 A3: 120 kOhm / 10 kOhm divider.
+float measuredInputVoltage = 0.0f;
+float voltageAdcNodeVoltage = 0.0f;
+bool voltageAdcValid = false;
+uint32_t lastVoltageRead = 0;
+const float VOLTAGE_DIVIDER_RATIO = 13.0f;
+const uint32_t VOLTAGE_SAMPLE_INTERVAL_MS = 100;
+
+// Continuity measurement on ADS1115 A1 (AIN1 referenced to GND).
+float continuityVoltage = 0.0f;
+bool continuityClosed = false;
+bool continuityAdcValid = false;
+uint32_t lastContinuityRead = 0;
+const float CONTINUITY_THRESHOLD_V = 0.20f;
+const uint32_t CONTINUITY_SAMPLE_INTERVAL_MS = 100;
+
+// Resistance measurement on ADS1115 A2 using the 10 kOhm reference divider.
+float resistanceVoltage = 0.0f;
+float measuredResistanceOhms = 0.0f;
+bool resistanceAdcValid = false;
+bool resistanceOpen = false;
+uint32_t lastResistanceRead = 0;
+const float RESISTANCE_REFERENCE_OHMS = 10000.0f;
+float resistanceSupplyVolts = 3.3f; // Calibrated from A2 at startup with probes disconnected.
+const float RESISTANCE_OPEN_MARGIN_V = 0.05f; // Within 50 mV of open-circuit level = OPEN.
+const uint32_t RESISTANCE_SAMPLE_INTERVAL_MS = 100;
+
+// Keep Serial Monitor readable: measurement values are logged at most once per second.
+uint32_t lastMeasurementLog = 0;
+const uint32_t MEASUREMENT_LOG_INTERVAL_MS = 1000;
+
 
 // ==================================================
 // STANDBY / OFF DISPLAY STATE
@@ -94,6 +134,11 @@ const char* getModeName(Mode mode) {
     }
 }
 
+bool isMeasurementMode(Mode mode) {
+    return mode == MODE_VOLTAGE || mode == MODE_RESISTANCE ||
+           mode == MODE_CONTINUITY || mode == MODE_TEMPERATURE;
+}
+
 // ==================================================
 // BUTTON HANDLING
 // ==================================================
@@ -132,7 +177,8 @@ void pollModeButton() {
         modeRawChangedAt = now;
     }
 
-    if ((uint32_t)(now - modeRawChangedAt) >= 35 && raw == LOW && !modeStablePressed) {
+    if ((uint32_t)(now - modeRawChangedAt) >= 35 &&
+        raw == LOW && !modeStablePressed) {
         modeStablePressed = true;
         modePressedAt = now;
         modeLongPressHandled = false;
@@ -147,11 +193,10 @@ void pollModeButton() {
         Serial.println("MODE button held 3 seconds: OFF");
     }
 
-    if ((uint32_t)(now - modeRawChangedAt) >= 35 && raw == HIGH && modeStablePressed) {
+    if ((uint32_t)(now - modeRawChangedAt) >= 35 &&
+        raw == HIGH && modeStablePressed) {
         modeStablePressed = false;
         if (!modeLongPressHandled) {
-            // A short press wakes OFF into STANDBY. After TEMPERATURE,
-            // return to STANDBY; from STANDBY, begin the measurement cycle.
             if (currentMode == MODE_OFF) {
                 currentMode = MODE_STANDBY;
             } else if (currentMode == MODE_TEMPERATURE) {
@@ -164,7 +209,7 @@ void pollModeButton() {
             }
             holdEnabled = false;
             if (currentMode == MODE_TEMPERATURE) {
-                liveTemperature = 0.0f; // refreshed by loop() immediately after mode change
+                liveTemperature = 0.0f;
             }
             bleStateChanged = true;
             Serial.printf("Short MODE press -> %s\n", getModeName(currentMode));
@@ -193,14 +238,211 @@ void detectADS1115() {
         }
     }
 
-    Serial.println(
-        adsFound ? "ADS1115 detected." : "ADS1115 NOT detected."
-    );
-
     if (adsFound) {
-        Serial.printf("ADS1115 address: 0x%02X\n", adsAddress);
+        Serial.printf("[I2C] ADS1115 detected at 0x%02X\n", adsAddress);
+    } else {
+        Serial.println("[ERROR] ADS1115 not detected. Check SDA, SCL, VDD and GND.");
     }
 }
+
+
+// ==================================================
+// CONTINUITY MEASUREMENT - ADS1115 A1
+// 3.3 V -> 1 kOhm -> sense node -> test probes -> GND
+// Closed circuit: approximately 0 V; open circuit: approximately 3.3 V.
+// ==================================================
+
+bool readADS1115SingleEndedVoltage(uint8_t channel, float &voltage) {
+    if (!adsFound || channel > 3) return false;
+
+    // MUX: 100=A0, 101=A1, 110=A2, 111=A3 (single-ended to GND).
+    // PGA +/-4.096 V, single-shot mode, 128 samples/second.
+    const uint16_t muxBits = (uint16_t)(0x04 + channel) << 12;
+    const uint16_t config =
+        0x8000 | muxBits | 0x0200 | 0x0100 | 0x0080 | 0x0003;
+
+    Wire.beginTransmission(adsAddress);
+    Wire.write(0x01);
+    Wire.write((uint8_t)(config >> 8));
+    Wire.write((uint8_t)(config & 0xFF));
+    if (Wire.endTransmission() != 0) return false;
+
+    delay(10);
+
+    Wire.beginTransmission(adsAddress);
+    Wire.write(0x00);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((int)adsAddress, 2) != 2) return false;
+
+    const int16_t raw = (int16_t)(
+        ((uint16_t)Wire.read() << 8) | (uint16_t)Wire.read()
+    );
+
+    voltage = raw * 0.000125f;
+    if (voltage < 0.0f) voltage = 0.0f;
+    return true;
+}
+
+bool readADS1115A0Voltage(float &voltage) {
+    return readADS1115SingleEndedVoltage(0, voltage);
+}
+
+bool readADS1115A1Voltage(float &voltage) {
+    return readADS1115SingleEndedVoltage(1, voltage);
+}
+
+bool readADS1115A2Voltage(float &voltage) {
+    return readADS1115SingleEndedVoltage(2, voltage);
+}
+
+bool readADS1115A3Voltage(float &voltage) {
+    return readADS1115SingleEndedVoltage(3, voltage);
+}
+
+// Calibrate the A2 divider's open-circuit voltage at startup.
+// IMPORTANT: Leave both resistance probes disconnected during power-up.
+bool calibrateResistanceReference() {
+    if (!adsFound) {
+        Serial.println("[CAL][SKIP] Resistance calibration: ADS1115 unavailable.");
+        return false;
+    }
+
+    const uint8_t sampleCount = 20;
+    float totalVoltage = 0.0f;
+
+    Serial.println("[CAL] Resistance reference: disconnect both probes.");
+
+    for (uint8_t i = 0; i < sampleCount; i++) {
+        float sampleVoltage = 0.0f;
+        if (!readADS1115A2Voltage(sampleVoltage)) {
+            Serial.println("[CAL][ERROR] A2 read failed; using default reference (3.300 V).");
+            return false;
+        }
+        totalVoltage += sampleVoltage;
+    }
+
+    const float averageVoltage = totalVoltage / sampleCount;
+
+    // Reject implausible readings rather than storing a bad calibration.
+    if (averageVoltage < 2.5f || averageVoltage > 3.6f) {
+        Serial.printf("[CAL][ERROR] A2 reference %.3f V is out of range; calibration rejected.\n",
+                      averageVoltage);
+        return false;
+    }
+
+    resistanceSupplyVolts = averageVoltage;
+    Serial.printf("[CAL][OK] Resistance reference calibrated: %.3f V\n",
+                  resistanceSupplyVolts);
+    return true;
+}
+
+void updateVoltageMeasurement() {
+    // Average eight A3 samples to reduce display jitter.
+    const uint8_t sampleCount = 8;
+    float totalNodeVoltage = 0.0f;
+
+    for (uint8_t i = 0; i < sampleCount; i++) {
+        float sampleVoltage = 0.0f;
+        if (!readADS1115A3Voltage(sampleVoltage)) {
+            voltageAdcValid = false;
+            Serial.println("[ERROR][VOLT] ADS1115 A3 read failed.");
+            return;
+        }
+        totalNodeVoltage += sampleVoltage;
+    }
+
+    voltageAdcNodeVoltage = totalNodeVoltage / sampleCount;
+    measuredInputVoltage = voltageAdcNodeVoltage * VOLTAGE_DIVIDER_RATIO;
+    voltageAdcValid = true;
+
+    if ((uint32_t)(millis() - lastMeasurementLog) >= MEASUREMENT_LOG_INTERVAL_MS) {
+        lastMeasurementLog = millis();
+        Serial.printf("[VOLT] A3 node: %.3f V | Input: %.2f V\n",
+                      voltageAdcNodeVoltage, measuredInputVoltage);
+    }
+}
+
+void updateContinuityMeasurement() {
+    // Average four A1 samples for a steadier OPEN/CLOSED decision.
+    constexpr uint8_t SAMPLE_COUNT = 4;
+    float totalVoltage = 0.0f;
+
+    for (uint8_t i = 0; i < SAMPLE_COUNT; i++) {
+        float sampleVoltage = 0.0f;
+        if (!readADS1115A1Voltage(sampleVoltage)) {
+            continuityAdcValid = false;
+            Serial.println("[ERROR][CONT] ADS1115 A1 read failed.");
+            return;
+        }
+        totalVoltage += sampleVoltage;
+    }
+
+    continuityVoltage = totalVoltage / SAMPLE_COUNT;
+    continuityClosed = (continuityVoltage < CONTINUITY_THRESHOLD_V);
+    continuityAdcValid = true;
+
+    if ((uint32_t)(millis() - lastMeasurementLog) >= MEASUREMENT_LOG_INTERVAL_MS) {
+        lastMeasurementLog = millis();
+        Serial.printf("[CONT] A1: %.3f V | State: %s\n",
+                      continuityVoltage,
+                      continuityClosed ? "CLOSED" : "OPEN");
+    }
+}
+
+void updateResistanceMeasurement() {
+    // Average eight A2 samples to improve resistance stability.
+    constexpr uint8_t SAMPLE_COUNT = 8;
+    float totalVoltage = 0.0f;
+
+    for (uint8_t i = 0; i < SAMPLE_COUNT; i++) {
+        float sampleVoltage = 0.0f;
+        if (!readADS1115A2Voltage(sampleVoltage)) {
+            resistanceAdcValid = false;
+            Serial.println("[ERROR][RES] ADS1115 A2 read failed.");
+            return;
+        }
+        totalVoltage += sampleVoltage;
+    }
+
+    resistanceVoltage = totalVoltage / SAMPLE_COUNT;
+
+    // Near 3.3 V, the unknown resistance is effectively open.
+    const float openThreshold = resistanceSupplyVolts - RESISTANCE_OPEN_MARGIN_V;
+    if (resistanceVoltage >= openThreshold) {
+        resistanceOpen = true;
+        measuredResistanceOhms = INFINITY;
+    } else {
+        const float denominator = resistanceSupplyVolts - resistanceVoltage;
+        if (denominator <= 0.001f) {
+            resistanceOpen = true;
+            measuredResistanceOhms = INFINITY;
+        } else {
+            // Rx = RREF * Vout / (Vcalibrated_open - Vout).
+            measuredResistanceOhms =
+                RESISTANCE_REFERENCE_OHMS * resistanceVoltage / denominator;
+            resistanceOpen = false;
+        }
+    }
+
+    resistanceAdcValid = true;
+
+    if ((uint32_t)(millis() - lastMeasurementLog) >= MEASUREMENT_LOG_INTERVAL_MS) {
+        lastMeasurementLog = millis();
+        if (resistanceOpen) {
+            Serial.printf("[RES] A2: %.3f V | Result: OPEN\n", resistanceVoltage);
+        } else if (measuredResistanceOhms >= 1000000.0f) {
+            Serial.printf("[RES] A2: %.3f V | Result: %.3f MOhm\n",
+                          resistanceVoltage, measuredResistanceOhms / 1000000.0f);
+        } else if (measuredResistanceOhms >= 1000.0f) {
+            Serial.printf("[RES] A2: %.3f V | Result: %.3f kOhm\n",
+                          resistanceVoltage, measuredResistanceOhms / 1000.0f);
+        } else {
+            Serial.printf("[RES] A2: %.3f V | Result: %.2f Ohm\n",
+                          resistanceVoltage, measuredResistanceOhms);
+        }
+    }
+}
+
 
 
 // ==================================================
@@ -219,14 +461,38 @@ const uint32_t BLE_NOTIFY_INTERVAL_MS = 100; // 10 updates/second when connected
 class VoltexServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer*) override {
         bleClientConnected = true;
-        Serial.println("BLE client connected.");
+        Serial.println("[BLE] Dashboard connected.");
     }
     void onDisconnect(BLEServer*) override {
         bleClientConnected = false;
-        Serial.println("BLE client disconnected; advertising again.");
+        Serial.println("[BLE] Dashboard disconnected. Advertising restarted.");
         BLEDevice::startAdvertising();
     }
 };
+
+// Capture the current measurement once so OLED and BLE use the same held sample.
+void captureCurrentMeasurementForHold() {
+    switch (currentMode) {
+        case MODE_VOLTAGE:
+            heldInputVoltage = measuredInputVoltage;
+            heldVoltageAdcValid = voltageAdcValid;
+            break;
+        case MODE_RESISTANCE:
+            heldResistanceOhms = measuredResistanceOhms;
+            heldResistanceAdcValid = resistanceAdcValid;
+            heldResistanceOpen = resistanceOpen;
+            break;
+        case MODE_CONTINUITY:
+            heldContinuityClosed = continuityClosed;
+            heldContinuityAdcValid = continuityAdcValid;
+            break;
+        case MODE_TEMPERATURE:
+            heldTemperature = liveTemperature;
+            break;
+        default:
+            break;
+    }
+}
 
 // Dashboard -> ESP32 commands use the same characteristic as telemetry.
 // Accepted examples:
@@ -251,16 +517,17 @@ class VoltexCharacteristicCallbacks : public BLECharacteristicCallbacks {
                 currentMode = requestedMode;
                 holdEnabled = false;
                 bleStateChanged = true;
-                Serial.printf("BLE command: mode -> %s\n", getModeName(currentMode));
+                Serial.printf("[BLE] Mode command -> %s\n", getModeName(currentMode));
             }
         } else if (command.indexOf("\"action\":\"SET_HOLD\"") >= 0) {
-            if (currentMode == MODE_TEMPERATURE) {
+            if (isMeasurementMode(currentMode)) {
                 const bool requestedHold = command.indexOf("\"value\":true") >= 0;
                 if (requestedHold != holdEnabled) {
-                    if (requestedHold) heldTemperature = liveTemperature;
+                    if (requestedHold) captureCurrentMeasurementForHold();
                     holdEnabled = requestedHold;
                     bleStateChanged = true;
-                    Serial.printf("BLE command: temperature HOLD -> %s\n", holdEnabled ? "ON" : "OFF");
+                    Serial.printf("[BLE] %s hold -> %s\n",
+                                  getModeName(currentMode), holdEnabled ? "ON" : "OFF");
                 }
             }
         }
@@ -286,7 +553,7 @@ void setupBLE() {
     advertising->addServiceUUID(BLE_SERVICE_UUID);
     advertising->setScanResponse(true);
     advertising->start();
-    Serial.println("BLE ready. Device name: VOLTEX (read/write/notify)");
+    Serial.println("[BLE] Ready | Device: VOLTEX | Read/Write/Notify enabled");
 }
 
 void notifyBLEMeasurements() {
@@ -295,7 +562,20 @@ void notifyBLEMeasurements() {
         (uint32_t)(now - lastBleNotify) < BLE_NOTIFY_INTERVAL_MS) return;
     lastBleNotify = now;
 
-    char payload[220];
+    char payload[280];
+    char voltageField[20];
+    const bool voltageValidForPacket =
+        currentMode == MODE_VOLTAGE &&
+        (holdEnabled ? heldVoltageAdcValid : voltageAdcValid);
+    const float voltageValueForPacket =
+        holdEnabled ? heldInputVoltage : measuredInputVoltage;
+
+    if (voltageValidForPacket) {
+        snprintf(voltageField, sizeof(voltageField), "%.3f", voltageValueForPacket);
+    } else {
+        snprintf(voltageField, sizeof(voltageField), "null");
+    }
+
     char temperatureField[20];
     if (currentMode == MODE_TEMPERATURE) {
         const float value = holdEnabled ? heldTemperature : liveTemperature;
@@ -304,15 +584,53 @@ void notifyBLEMeasurements() {
         snprintf(temperatureField, sizeof(temperatureField), "null");
     }
 
-    // Voltage, resistance, and continuity remain null until their acquisition
-    // circuits are implemented and validated in firmware. Never fabricate data.
+    char continuityField[8];
+    const bool continuityValidForPacket =
+        currentMode == MODE_CONTINUITY &&
+        (holdEnabled ? heldContinuityAdcValid : continuityAdcValid);
+    const bool continuityValueForPacket =
+        holdEnabled ? heldContinuityClosed : continuityClosed;
+
+    if (continuityValidForPacket) {
+        snprintf(continuityField, sizeof(continuityField), "%s",
+                 continuityValueForPacket ? "true" : "false");
+    } else {
+        snprintf(continuityField, sizeof(continuityField), "null");
+    }
+
+    char resistanceField[24];
+    const bool resistanceValidForPacket =
+        currentMode == MODE_RESISTANCE &&
+        (holdEnabled ? heldResistanceAdcValid : resistanceAdcValid);
+    const bool resistanceOpenForPacket =
+        holdEnabled ? heldResistanceOpen : resistanceOpen;
+    const float resistanceValueForPacket =
+        holdEnabled ? heldResistanceOhms : measuredResistanceOhms;
+
+    if (resistanceValidForPacket && !resistanceOpenForPacket) {
+        snprintf(resistanceField, sizeof(resistanceField), "%.2f",
+                 resistanceValueForPacket);
+    } else {
+        snprintf(resistanceField, sizeof(resistanceField), "null");
+    }
+
+    const char* resistanceOpenField =
+        resistanceValidForPacket
+            ? (resistanceOpenForPacket ? "true" : "false")
+            : "null";
+
+    // Continuity state is reported from the ADS1115 A1 measurement.
     snprintf(payload, sizeof(payload),
-        "{\"mode\":\"%s\",\"voltageV\":null,\"resistanceOhm\":null,\"continuityClosed\":null,\"temperatureC\":%s,\"holdEnabled\":%s,\"adsFound\":%s,\"timestampMs\":%lu}",
+        "{\"mode\":\"%s\",\"voltageV\":%s,\"resistanceOhm\":%s,\"resistanceOpen\":%s,\"continuityClosed\":%s,\"temperatureC\":%s,\"holdEnabled\":%s,\"adsFound\":%s,\"timestampMs\":%lu}",
         currentMode == MODE_STANDBY ? "STANDBY" :
         currentMode == MODE_VOLTAGE ? "V_DC" :
         currentMode == MODE_RESISTANCE ? "RESISTANCE" :
         currentMode == MODE_CONTINUITY ? "CONTINUITY" :
         currentMode == MODE_TEMPERATURE ? "TEMPERATURE" : "OFF",
+        voltageField,
+        resistanceField,
+        resistanceOpenField,
+        continuityField,
         temperatureField,
         holdEnabled ? "true" : "false",
         adsFound ? "true" : "false",
@@ -326,20 +644,26 @@ void notifyBLEMeasurements() {
 // LM35 TEMPERATURE
 // ==================================================
 
-float readLM35Celsius() {
-    // 10-sample average for steadier temperature readings.
-    uint32_t totalMilliVolts = 0;
-    constexpr int SAMPLE_COUNT = 10;
+bool readLM35Celsius(float &temperatureC) {
+    // Read LM35 output through ADS1115 A0 (not ESP32 GPIO34).
+    constexpr uint8_t SAMPLE_COUNT = 8;
+    float totalVoltage = 0.0f;
 
-    for (int i = 0; i < SAMPLE_COUNT; i++) {
-        totalMilliVolts += analogReadMilliVolts(LM35_PIN);
-        if (i + 1 < SAMPLE_COUNT) delay(1);
+    for (uint8_t i = 0; i < SAMPLE_COUNT; i++) {
+        float sampleVoltage = 0.0f;
+        if (!readADS1115A0Voltage(sampleVoltage)) {
+            Serial.println("[ERROR][TEMP] LM35 read failed on ADS1115 A0.");
+            return false;
+        }
+        totalVoltage += sampleVoltage;
     }
 
-    const float milliVolts = totalMilliVolts / static_cast<float>(SAMPLE_COUNT);
+    const float averageVoltage = totalVoltage / SAMPLE_COUNT;
+    const float milliVolts = averageVoltage * 1000.0f;
 
-    // LM35 output: approximately 10 mV per degree C
-    return milliVolts / 10.0f;
+    // LM35: approximately 10 mV per degree Celsius.
+    temperatureC = milliVolts / 10.0f;
+    return true;
 }
 
 // ==================================================
@@ -562,6 +886,11 @@ void drawOffScreen() {
 // MODE DISPLAY
 // ==================================================
 
+void drawHoldStatus() {
+    oled.setFont(u8g2_font_5x8_tf);
+    drawCentered(holdEnabled ? "HOLD ON" : "LIVE", 61);
+}
+
 void drawModeScreen() {
     oled.clearBuffer();
     oled.drawFrame(0, 0, 128, 64);
@@ -581,29 +910,65 @@ void drawModeScreen() {
             drawOffScreen();
             return;
 
-        case MODE_VOLTAGE:
+        case MODE_VOLTAGE: {
             oled.setFont(u8g2_font_6x10_tf);
             drawCentered("DC VOLTAGE", 26);
 
-            oled.setFont(u8g2_font_helvB18_tf);
-            drawCentered("0.00 V", 53);
+            // Keep all four measurement values at the same size and baseline.
+            oled.setFont(u8g2_font_helvB14_tf);
+            const bool valid = holdEnabled ? heldVoltageAdcValid : voltageAdcValid;
+            const float value = holdEnabled ? heldInputVoltage : measuredInputVoltage;
+            if (!valid) {
+                drawCentered("ADC ERROR", 48);
+            } else {
+                snprintf(reading, sizeof(reading), "%.2f V", value);
+                drawCentered(reading, 48);
+            }
+            drawHoldStatus();
             break;
+        }
 
-        case MODE_RESISTANCE:
+        case MODE_RESISTANCE: {
             oled.setFont(u8g2_font_6x10_tf);
             drawCentered("RESISTANCE", 26);
 
-            oled.setFont(u8g2_font_helvB18_tf);
-            drawCentered("0 Ohm", 53);
+            oled.setFont(u8g2_font_helvB14_tf);
+            const bool valid = holdEnabled ? heldResistanceAdcValid : resistanceAdcValid;
+            const bool isOpen = holdEnabled ? heldResistanceOpen : resistanceOpen;
+            const float value = holdEnabled ? heldResistanceOhms : measuredResistanceOhms;
+            if (!valid) {
+                drawCentered("ADC ERROR", 48);
+            } else if (isOpen) {
+                drawCentered("0.0 Ohm", 48);
+            } else if (value >= 1000000.0f) {
+                snprintf(reading, sizeof(reading), "%.2f MOhm", value / 1000000.0f);
+                drawCentered(reading, 48);
+            } else if (value >= 1000.0f) {
+                snprintf(reading, sizeof(reading), "%.2f kOhm", value / 1000.0f);
+                drawCentered(reading, 48);
+            } else {
+                snprintf(reading, sizeof(reading), "%.1f Ohm", value);
+                drawCentered(reading, 48);
+            }
+            drawHoldStatus();
             break;
+        }
 
-        case MODE_CONTINUITY:
+        case MODE_CONTINUITY: {
             oled.setFont(u8g2_font_6x10_tf);
             drawCentered("CONTINUITY", 26);
 
             oled.setFont(u8g2_font_helvB14_tf);
-            drawCentered("OPEN", 49);
+            const bool valid = holdEnabled ? heldContinuityAdcValid : continuityAdcValid;
+            const bool closed = holdEnabled ? heldContinuityClosed : continuityClosed;
+            if (!valid) {
+                drawCentered("ADC ERROR", 48);
+            } else {
+                drawCentered(closed ? "CLOSED" : "OPEN", 48);
+            }
+            drawHoldStatus();
             break;
+        }
 
         case MODE_TEMPERATURE: {
             float temperature =
@@ -614,11 +979,10 @@ void drawModeScreen() {
             oled.setFont(u8g2_font_6x10_tf);
             drawCentered("TEMPERATURE", 26);
 
-            oled.setFont(u8g2_font_helvB18_tf);
-            drawCentered(reading, 49);
+            oled.setFont(u8g2_font_helvB14_tf);
+            drawCentered(reading, 48);
 
-            oled.setFont(u8g2_font_5x8_tf);
-            drawCentered(holdEnabled ? "HOLD ON" : "LIVE", 61);
+            drawHoldStatus();
             break;
         }
 
@@ -639,8 +1003,6 @@ void setup() {
     pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(HOLD_BUTTON_PIN, INPUT_PULLUP);
 
-    analogReadResolution(12);
-    analogSetPinAttenuation(LM35_PIN, ADC_11db);
 
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(100000);
@@ -651,26 +1013,36 @@ void setup() {
 
     startupAnimation();
     detectADS1115();
+
+    // Keep resistance probes disconnected during this one-time startup calibration.
+    calibrateResistanceReference();
+
     setupBLE();
 
-    liveTemperature = readLM35Celsius();
-    heldTemperature = liveTemperature;
+    if (readLM35Celsius(liveTemperature)) {
+        heldTemperature = liveTemperature;
+    } else {
+        liveTemperature = 0.0f;
+        heldTemperature = 0.0f;
+    }
 
     offScreenPage = 0;
     lastOffScreenChange = millis();
     drawModeScreen();
 
     Serial.println();
-    Serial.println("VOLTEX ready.");
-    Serial.println("MODE: GPIO 25");
-    Serial.println("HOLD: GPIO 26");
-    Serial.println("LM35: GPIO 34");
-
-    Serial.printf(
-        "Current mode: %d (%s)\n",
-        (int)currentMode,
-        getModeName(currentMode)
-    );
+    Serial.println("==============================================");
+    Serial.println("              VOLTEX MULTIMETER              ");
+    Serial.println("==============================================");
+    Serial.println("[BOOT] Firmware initialization complete.");
+    Serial.println("[PIN ] MODE       : GPIO 25");
+    Serial.println("[PIN ] HOLD       : GPIO 26");
+    Serial.println("[ADC ] LM35       : ADS1115 A0");
+    Serial.println("[ADC ] Continuity : ADS1115 A1");
+    Serial.println("[ADC ] Resistance : ADS1115 A2");
+    Serial.println("[ADC ] Voltage    : ADS1115 A3 (divider x13)");
+    Serial.printf("[SYS ] Current mode: %s\n", getModeName(currentMode));
+    Serial.println("----------------------------------------------");
 }
 
 // ==================================================
@@ -686,8 +1058,9 @@ void loop() {
         offScreenPage = 0;
         lastOffScreenChange = now;
         if (currentMode == MODE_TEMPERATURE && !holdEnabled) {
-            liveTemperature = readLM35Celsius();
-            heldTemperature = liveTemperature;
+            if (readLM35Celsius(liveTemperature)) {
+                heldTemperature = liveTemperature;
+            }
         }
         drawModeScreen();
         lastDisplayUpdate = millis();
@@ -696,27 +1069,19 @@ void loop() {
     // MODE button: short press cycles modes; 3-second hold enters OFF.
     pollModeButton();
 
-    // HOLD button: temperature mode only
+    // HOLD button: freeze/resume the same measurement snapshot on OLED and BLE.
     if (wasPressed(holdButton)) {
-        if (currentMode == MODE_TEMPERATURE) {
-            if (!holdEnabled) {
-                heldTemperature = liveTemperature;
-                holdEnabled = true;
-            } else {
-                holdEnabled = false;
-            }
+        if (isMeasurementMode(currentMode)) {
+            if (!holdEnabled) captureCurrentMeasurementForHold();
+            holdEnabled = !holdEnabled;
+            bleStateChanged = true;
 
-            Serial.printf(
-                "Temperature HOLD: %s\n",
-                holdEnabled ? "ON" : "OFF"
-            );
-
+            Serial.printf("[HOLD] %s -> %s\n", getModeName(currentMode),
+                          holdEnabled ? "HOLD ON" : "LIVE");
             drawModeScreen();
             lastDisplayUpdate = millis();
         } else {
-            Serial.println(
-                "HOLD works in TEMP mode only during this test."
-            );
+            Serial.println("[HOLD] Ignored: select a measurement mode first.");
         }
     }
 
@@ -737,10 +1102,39 @@ void loop() {
         (uint32_t)(now - lastSensorRead) >= 100) {
 
         lastSensorRead = now;
-        liveTemperature = readLM35Celsius();
+        if (readLM35Celsius(liveTemperature)) {
+            if ((uint32_t)(millis() - lastMeasurementLog) >= MEASUREMENT_LOG_INTERVAL_MS) {
+                lastMeasurementLog = millis();
+                Serial.printf("[TEMP] A0: %.1f C\n", liveTemperature);
+            }
+            drawModeScreen();
+            lastDisplayUpdate = millis();
+        }
+    }
 
-        Serial.printf("LM35: %.1f C\n", liveTemperature);
+    // Sample DC voltage input on ADS1115 A3 every 100 ms in voltage mode.
+    if (currentMode == MODE_VOLTAGE && !holdEnabled &&
+        (uint32_t)(now - lastVoltageRead) >= VOLTAGE_SAMPLE_INTERVAL_MS) {
+        lastVoltageRead = now;
+        updateVoltageMeasurement();
+        drawModeScreen();
+        lastDisplayUpdate = millis();
+    }
 
+    // Sample continuity input on ADS1115 A1 every 100 ms while in that mode.
+    if (currentMode == MODE_CONTINUITY && !holdEnabled &&
+        (uint32_t)(now - lastContinuityRead) >= CONTINUITY_SAMPLE_INTERVAL_MS) {
+        lastContinuityRead = now;
+        updateContinuityMeasurement();
+        drawModeScreen();
+        lastDisplayUpdate = millis();
+    }
+
+    // Sample resistance input on ADS1115 A2 every 100 ms in resistance mode.
+    if (currentMode == MODE_RESISTANCE && !holdEnabled &&
+        (uint32_t)(now - lastResistanceRead) >= RESISTANCE_SAMPLE_INTERVAL_MS) {
+        lastResistanceRead = now;
+        updateResistanceMeasurement();
         drawModeScreen();
         lastDisplayUpdate = millis();
     }
