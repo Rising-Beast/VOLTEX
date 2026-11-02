@@ -29,7 +29,13 @@ function readHardwareValue(mode, packet) {
   if (!packet) return null;
   switch (mode) {
     case "V_DC": return Number.isFinite(packet.voltageV) ? packet.voltageV : null;
-    case "RESISTANCE": return Number.isFinite(packet.resistanceOhm) ? packet.resistanceOhm : null;
+    case "RESISTANCE":
+      // The ESP32 reports an open probe state separately because resistanceOhm
+      // is null when no resistor is connected. Match the OLED's requested idle
+      // display by showing 0.0 Ω on the dashboard for that explicit state.
+      if (Number.isFinite(packet.resistanceOhm)) return packet.resistanceOhm;
+      if (packet.resistanceOpen === true) return 0;
+      return null;
     case "CONTINUITY": return typeof packet.continuityClosed === "boolean" ? (packet.continuityClosed ? 1 : 0) : null;
     case "TEMPERATURE": return Number.isFinite(packet.temperatureC) ? packet.temperatureC : null;
     default: return null;
@@ -404,7 +410,7 @@ function SelectorDial({ mode, onSelect, powered, demoOn = false, demoValue = 0, 
           style={{
             transformOrigin: `${center}px ${center}px`,
             transform: `rotate(${needleAngle}deg)`,
-            transition: "transform 600ms cubic-bezier(0.34, 1.56, 0.64, 1)",
+            transition: "transform 460ms cubic-bezier(0.22, 1, 0.36, 1)",
           }}
         >
           <path
@@ -510,6 +516,10 @@ function ErrorAnalysis({ mode, readingValue, onExit, onDisplayModeChange, onRequ
     : "VOLTAGE";
   const [tab, setTab] = useState(initialAnalysisTab);
   const [statsMode, setStatsMode] = useState(initialStatsMode);
+  // When a dashboard tab requests a hardware mode, ignore interim/stale BLE
+  // mode packets until the ESP32 confirms the requested mode. This prevents
+  // the tab briefly jumping back to Voltage while the mode command is in flight.
+  const pendingAnalysisModeRef = useRef(null);
   const [referenceVoltage, setReferenceVoltage] = useState("00.00");
   const [referenceResistance, setReferenceResistance] = useState("00.00");
   const [referenceTemperature, setReferenceTemperature] = useState("00.00");
@@ -529,6 +539,14 @@ function ErrorAnalysis({ mode, readingValue, onExit, onDisplayModeChange, onRequ
   // physical ESP32 button. This effect only changes the tab; it does not send
   // a command back to the hardware.
   useEffect(() => {
+    const pendingMode = pendingAnalysisModeRef.current;
+    if (pendingMode) {
+      // Keep the user's selected tab stable while the ESP32 is switching.
+      // Only release the pending request when the hardware confirms that mode.
+      if (mode !== pendingMode) return;
+      pendingAnalysisModeRef.current = null;
+    }
+
     // Keep Statistics selected while its parameter changes the hardware mode.
     // Outside Statistics, follow physical/dashboard measurement-mode changes.
     if (tab !== "STATISTICS") {
@@ -732,6 +750,13 @@ function ErrorAnalysis({ mode, readingValue, onExit, onDisplayModeChange, onRequ
                 setTab(item.id);
                 const requestedMode = item.id === "VOLTAGE" ? "V_DC" : item.id;
                 if (["V_DC", "RESISTANCE", "TEMPERATURE"].includes(requestedMode)) {
+                  // Set this before requesting the mode so any quick stale BLE
+                  // packet cannot override the tab the user just selected.
+                  if (hardwareConnected && mode !== requestedMode) {
+                    pendingAnalysisModeRef.current = requestedMode;
+                  } else {
+                    pendingAnalysisModeRef.current = null;
+                  }
                   onRequestHardwareMode?.(requestedMode);
                 }
               }}
@@ -1404,6 +1429,23 @@ export default function App() {
   }, []);
 
   const connectHardware = useCallback(async () => {
+    // Unlock Web Audio from the same user gesture that starts the BLE connection.
+    // Browsers may block audio that is first requested later from a BLE notification.
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (AudioContextClass) {
+        const audio = audioRef.current;
+        audio.context = audio.context || new AudioContextClass();
+        if (audio.context.state === "suspended") {
+          void audio.context.resume().catch((error) => {
+            console.warn("Audio context could not be resumed:", error);
+          });
+        }
+      }
+    } catch (error) {
+      console.warn("Web Audio is unavailable:", error);
+    }
+
     if (!navigator.bluetooth) {
       setHardwareStatus("USE CHROME / HTTPS");
       return;
@@ -1427,9 +1469,12 @@ export default function App() {
             // The ESP32 is the source of truth for HOLD. When HOLD engages,
             // capture the exact value carried in that same BLE packet so the
             // dashboard never freezes the preceding browser-side reading.
-            if (packet.holdEnabled && packet.mode === "TEMPERATURE" && Number.isFinite(packet.temperatureC)) {
-              setAnalysisReadingValue(packet.temperatureC);
-              setReadingValue(packet.temperatureC);
+            if (packet.holdEnabled) {
+              const heldValue = readHardwareValue(packet.mode, packet);
+              if (Number.isFinite(heldValue)) {
+                setAnalysisReadingValue(heldValue);
+                setReadingValue(heldValue);
+              }
             }
             setAnalysisPaused(packet.holdEnabled);
           }
@@ -1681,10 +1726,15 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (currentMode !== "CONTINUITY" || !powered || !continuityClosed || !toneEnabled) {
+    // The ESP32 updates continuityClosed through BLE notifications. Start the
+    // dashboard tone when that hardware state becomes CLOSED; the old effect
+    // only stopped audio and never started it for hardware-originated changes.
+    if (currentMode === "CONTINUITY" && powered && continuityClosed && toneEnabled) {
+      void startTone();
+    } else {
       stopTone();
     }
-  }, [currentMode, powered, continuityClosed, toneEnabled, stopTone]);
+  }, [currentMode, powered, continuityClosed, toneEnabled, startTone, stopTone]);
 
   useEffect(() => {
     if (hardwareConnected) return undefined;
@@ -1713,7 +1763,7 @@ export default function App() {
     graphStartRef.current = Date.now();
     graphElapsedRef.current = 0;
     setGraphPaused(false);
-  }, [currentMode, middleView, powered, continuityClosed]);
+  }, [currentMode, middleView, powered]);
 
   useEffect(() => {
     if (!powered || middleView !== "GRAPH" || graphPaused) return undefined;
@@ -1890,9 +1940,11 @@ export default function App() {
             readingValue={analysisReadingValue}
             isPaused={analysisPaused}
             onTogglePause={() => {
-              if (hardwareConnected && currentMode === "TEMPERATURE") {
-                // Ask the ESP32 to toggle HOLD and wait for its authoritative
-                // BLE packet before freezing the dashboard value.
+              if (
+                hardwareConnected &&
+                ["V_DC", "RESISTANCE", "CONTINUITY", "TEMPERATURE"].includes(currentMode)
+              ) {
+                // ESP32 owns the frozen sample; OLED and dashboard receive it in BLE.
                 const currentlyHeld = hardwarePacketRef.current?.holdEnabled === true;
                 void sendBleCommand({ action: "SET_HOLD", value: !currentlyHeld });
               } else {
